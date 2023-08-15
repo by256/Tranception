@@ -37,8 +37,14 @@ from tranception.config import TranceptionConfig
 from tranception.outputs import (
     TranceptionCausalLMOutputWithCrossAttentions,
 )
-from tranception.utils import msa_utils
-from tranception.utils import scoring_utils
+# from tranception.utils import msa_utils
+from tranception.utils.msa_utils import get_msa_prior, update_retrieved_MSA_log_prior_indel
+# from tranception.utils import scoring_utils
+from tranception.utils.scoring_utils import (
+    get_sequence_slices, 
+    get_tranception_scores_mutated_sequences,
+    sequence_replace,
+)
 
 def nanmean(v, *args, inplace=False, **kwargs):
     if not inplace:
@@ -659,7 +665,7 @@ class TranceptionLMHeadModel(GPT2PreTrainedModel):
             self.full_protein_length = config.full_protein_length if hasattr(config, "full_protein_length") else -1
             
             self.MSA_log_prior = torch.log(torch.tensor(
-                                                        msa_utils.get_msa_prior(
+                                                            get_msa_prior(
                                                             MSA_data_file=self.MSA_filename, 
                                                             MSA_weight_file_name=config.MSA_weight_file_name, 
                                                             retrieval_aggregation_mode=self.retrieval_aggregation_mode,
@@ -797,7 +803,7 @@ class TranceptionLMHeadModel(GPT2PreTrainedModel):
                     truncated_sequence_text = mutated_sequence[0][start_slice[0]:end_slice[0]]
                     if len(truncated_sequence_text)!=shift_logits.shape[1]-1: # shift_logits only has one extra token compared to truncated_sequence_text (the BOS token)
                         print("Tokenization error -- seq length: {} and shift_logits length - 1 : {}".format(len(mutated_sequence),shift_logits.shape[1]-1))
-                    MSA_log_prior, MSA_start, MSA_end = msa_utils.update_retrieved_MSA_log_prior_indel(self, self.MSA_log_prior, self.MSA_start, self.MSA_end, mutated_sequence[0])  
+                    MSA_log_prior, MSA_start, MSA_end = update_retrieved_MSA_log_prior_indel(self, self.MSA_log_prior, self.MSA_start, self.MSA_end, mutated_sequence[0])  
                 
                 elif self.retrieval_aggregation_mode=="aggregate_substitution":
                     MSA_log_prior=self.MSA_log_prior
@@ -885,22 +891,22 @@ class TranceptionLMHeadModel(GPT2PreTrainedModel):
         indel_mode: (bool) Flag to be used when scoring insertions and deletions. Otherwise assumes substitutions.
         """
         df = DMS_data.copy()
-        if ('mutated_sequence' not in df) and (not indel_mode): df['mutated_sequence'] = df['mutant'].apply(lambda x: scoring_utils.get_mutated_sequence(target_seq, x))
+        if ('mutated_sequence' not in df) and (not indel_mode): df['mutated_sequence'] = df['mutant'].apply(lambda x: get_mutated_sequence(target_seq, x))
         assert ('mutated_sequence' in df), "DMS file to score does not have mutated_sequence column"
         #if 'mutant' not in df: df['mutant'] = df['mutated_sequence'] #if mutant not in DMS file we default to mutated_sequence
         if 'DMS_score' in df: del df['DMS_score'] 
         if 'DMS_score_bin' in df: del df['DMS_score_bin'] 
         if target_seq is not None:
-            df_left_to_right_slices = scoring_utils.get_sequence_slices(df, target_seq=target_seq, model_context_len = self.config.n_ctx - 2, indel_mode=indel_mode, scoring_window=self.config.scoring_window)
+            df_left_to_right_slices = get_sequence_slices(df, target_seq=target_seq, model_context_len = self.config.n_ctx - 2, indel_mode=indel_mode, scoring_window=self.config.scoring_window)
         else:
-            df_left_to_right_slices = scoring_utils.get_sequence_slices(df, target_seq=list(df['mutated_sequence'])[0], model_context_len = self.config.n_ctx - 2, indel_mode=indel_mode, scoring_window='sliding')
+            df_left_to_right_slices = get_sequence_slices(df, target_seq=list(df['mutated_sequence'])[0], model_context_len = self.config.n_ctx - 2, indel_mode=indel_mode, scoring_window='sliding')
         print("Scoring sequences from left to right")
-        scores_L_to_R = scoring_utils.get_tranception_scores_mutated_sequences(model=self, mutated_sequence_df=df_left_to_right_slices, batch_size_inference=batch_size_inference, score_var_name='avg_score_L_to_R', target_seq=target_seq, num_workers=num_workers, indel_mode=indel_mode)
+        scores_L_to_R = get_tranception_scores_mutated_sequences(model=self, mutated_sequence_df=df_left_to_right_slices, batch_size_inference=batch_size_inference, score_var_name='avg_score_L_to_R', target_seq=target_seq, num_workers=num_workers, indel_mode=indel_mode)
         if scoring_mirror: 
             print("Scoring sequences from right to left")
             df_right_to_left_slices = df_left_to_right_slices.copy()
             df_right_to_left_slices['sliced_mutated_sequence'] = df_right_to_left_slices['sliced_mutated_sequence'].apply(lambda x: x[::-1])
-            scores_R_to_L = scoring_utils.get_tranception_scores_mutated_sequences(model=self, mutated_sequence_df=df_right_to_left_slices, batch_size_inference=batch_size_inference, score_var_name='avg_score_R_to_L', target_seq=target_seq, num_workers=num_workers, reverse=True, indel_mode=indel_mode)
+            scores_R_to_L = get_tranception_scores_mutated_sequences(model=self, mutated_sequence_df=df_right_to_left_slices, batch_size_inference=batch_size_inference, score_var_name='avg_score_R_to_L', target_seq=target_seq, num_workers=num_workers, reverse=True, indel_mode=indel_mode)
             all_scores = pd.merge(scores_L_to_R, scores_R_to_L, on='mutated_sequence', how='left', suffixes=('','_R_to_L'))
             all_scores['avg_score'] = (all_scores['avg_score_L_to_R'] + all_scores['avg_score_R_to_L']) / 2.0
         else:
@@ -919,9 +925,9 @@ class TranceptionLMHeadModel(GPT2PreTrainedModel):
         """
         Method to process an input AA sequence batch (protein_sequence) and return a tokenized sequence (via the tokenizer associated to the model).
         """
-        protein_sequence[sequence_name] = scoring_utils.sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='X', char_replacements='ACDEFGHIKLMNPQRSTVWY')
-        protein_sequence[sequence_name] = scoring_utils.sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='B', char_replacements='DN')
-        protein_sequence[sequence_name] = scoring_utils.sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='J', char_replacements='IL')
-        protein_sequence[sequence_name] = scoring_utils.sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='Z', char_replacements='EQ')
+        protein_sequence[sequence_name] = sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='X', char_replacements='ACDEFGHIKLMNPQRSTVWY')
+        protein_sequence[sequence_name] = sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='B', char_replacements='DN')
+        protein_sequence[sequence_name] = sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='J', char_replacements='IL')
+        protein_sequence[sequence_name] = sequence_replace(sequences=protein_sequence[sequence_name], char_to_replace='Z', char_replacements='EQ')
         return self.config.tokenizer(list(protein_sequence[sequence_name]), add_special_tokens=True, truncation=True, padding=True, max_length=self.config.n_ctx)
 
