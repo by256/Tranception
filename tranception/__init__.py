@@ -1,1 +1,1 @@
-# from tranception import config
+from . import config
